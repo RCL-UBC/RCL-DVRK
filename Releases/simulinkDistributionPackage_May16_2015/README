@@ -1,0 +1,641 @@
+This document describes the changes required to implement the cisst/saw to Simulink interface based on TCP/IP sockets. 
+
+Author: Angelica Ruszkowski, Robotics and Control Lab, University of British Columbia
+Supervisor: Septimiu Salcudean
+Date: 2015-05-16
+Contact: angelicar@ece.ubc.ca
+
+Version 1.1
+
+==========================================================================================================================
+NOTES
+==========================================================================================================================
+-This version includes the recent changes added to the cisst-saw git repository on April 28 regarding extra safety limits. (Note: waypoint mode was not updated, but code snippets should be able to be integrated nicely. I should have this done on Tuesday)
+
+-The Cartesian controller DOES NOT WORK in this update, but joint level is fine.
+
+-Included files in this package:
+--my versions of the new/modified cisst/saw files
+--matlab files:
+---cpp files for the s-function simulink blocks
+---example simulink models
+--some example code for "waypoint mode" we implemented. In this case, the socket is used to command the slaves from an external device
+
+TO DOs:
+- Make Cartesian controller work with new updates (guessing new units are throwing it off somewhere)
+- Implement Windows version for the Simulink side
+
+==========================================================================================================================
+Instructions for use
+==========================================================================================================================
+0) Integrate the changes listed in the next section of this patch
+
+1) Let's start with the C++ side. In your main.cpp application file, add the following lines: 
+(For example, in the mainTeleoperation.cpp, can add a simulink controller for the slave or the master)
+
+ #include <sawControllers/mtsSimulinkControllerQtWidget.h>
+
+ bool usingSimulink = true;
+
+ mtsIntuitiveResearchKitConsole::Arm * arm = new mtsIntuitiveResearchKitConsole::Arm(armName, io->GetName());
+ arm->ConfigurePID("sawControllersPID-PSM.xml"); //or sawControllersPID-MTM.xml
+ if(usingSimulink) {
+    	arm->ConfigureSimulinkController(numberOfJoints);
+ }
+ arm->ConfigureArm(mtsIntuitiveResearchKitConsole::Arm::ARM_PSM, "dvpsm.rob", 3.0 * cmn_ms, usingSimulink); //assuming PSM
+ console->AddArm(arm);
+
+ //PID GUI
+ mtsPIDQtWidget * pidGUI = new mtsPIDQtWidget("PID Arm", numberOfJoints, 50.0 * cmn_ms, usingSimulink);
+
+ //Simulink GUI
+ mtsSimulinkControllerQtWidget * simulinkArmGUI;
+ if(usingSimulink) {
+        simulinkArmGUI = new mtsSimulinkControllerQtWidget("Simulink Arm", numberOfJoints, 50.0 * cmn_ms, 12345, 54321); //you specify your port numbers here!
+        simulinkArmGUI->Configure();
+        componentManager->AddComponent(simulinkArmGUI);
+
+        //connections for mtm
+        componentManager->Connect(simulinkArmGUI->GetName(),              "PIDController",                  arm->PIDComponentName(),                "Controller");   //just to read joint type
+        componentManager->Connect(simulinkArmGUI->GetName(),              "RobotArmSimGUI",                 arm->Name(),                            "Robot");        //just to read desired cartesian position
+
+        componentManager->Connect(simulinkArmGUI->GetName(),              "SimulinkControllerPIDGUI",       arm->SimulinkControllerComponentName(), "SimulinkController");
+        componentManager->Connect(arm->SimulinkControllerComponentName(), "SignalSimulinkSocketsDone",      simulinkArmGUI->GetName(),              "SignalSimulinkDoneHighLevel");
+        componentManager->Connect(simulinkArmGUI->GetName(),              "PidQtInterfaceSimulinkCommand",  pidGUI->GetName(),                      "SimulinkQtInterfaceSimulinkCommand");
+        componentManager->Connect(pidGUI->GetName(),                      "SimulinkQtInterfacePIDCommand",  simulinkArmGUI->GetName(),              "PidQtInterfacePIDCommand");
+ }
+
+ if(usingSimulink) {
+        tabWidget->addTab(simulinkArmGUI,  "Simulink Arm");
+ }
+
+2) Note you can to specify the port numbers in the mtsSimulinkControllerQtWidget constructor, or in the GUI. The ports aren't opened until you hit the "Enable Simulink Control" check box.  Both ports are opened on the computer on which the cisst/saw code is running. You must specify the IP address of this computer in the parameters of the s-function blocks in the simulink model. Note about initialization: once you check the "Enable Simulink Control" check box, you have 8 seconds to connect to the sockets (done in the initialization of the simulink model), otherwise a timeout will occur. You can try again after the timeout, no problem. If you do connect succesfully, the cisst/saw code will send a packet of kinematic data, and wait until simulink sends back the corresponding torque data. This first transaction always takes significantly longer than all subsequent interactions, so the robot will not actually be controlled by the simulink controller until after this first transaction is complete. The default mtsPID.cpp controller will be in control if a) the user terminates the simulink simulation, or the simulink simulation times out/completes b) the user disables simulink control through the GUI (unchecks the check box) c) the user re-enables the PID or d) there is too long an interruption in the communication between simulink and c++.
+
+3) That should be good to go! To enable/disable the Simulink controller, "Direct Control" must be enabled 
+
+4) Note, if want to run cartesian controller, make sure the "Simulink Joint Control" checkbox is UNCHECKED, otherwise the system will complain.
+
+==========================================================================================================================
+Matlab side
+==========================================================================================================================
+Just some pointers on the Matlab/Simulink side, 
+- make sure to mex the .cpp files before trying to use them in simulation
+- note you must be in the directory which houses the .slx and .cpp files when attempting to run the simulation (probably very obvious, but I forget this sometimes)
+- make sure to configure the s-function blocks with the correct IP address and port numbers!
+
+==========================================================================================================================
+C++ cisst/saw modifications
+==========================================================================================================================
+Files to add:
+--------------------------------------------------------------------------------------------------------------------------
+in cisst/cisstParameterTypes/code: 
+add prmSimulinkDataPacket.cpp              
+add prmSocketDataPacket.cpp                
+add prmTwoWaySocket.cpp 
+
+--------------------------------------------------------------------------------------------------------------------------
+in cisst/cisstParameterTypes: 
+add prmSimulinkDataPacket.h              
+add prmSocketDataPacket.h                
+add prmTwoWaySocket.h   
+
+--------------------------------------------------------------------------------------------------------------------------
+in sawControllers/code: 
+add mtsSimulinkController.cpp  
+
+--------------------------------------------------------------------------------------------------------------------------
+in sawControllers/code/Qt
+add mtsSimulinkControllerQtWidget.cpp 
+
+--------------------------------------------------------------------------------------------------------------------------
+in sawControllers/include/sawControllers
+add mtsSimulinkController.h         
+add mtsSimulinkControllerQtWidget.h 
+
+
+Files to Modify
+--------------------------------------------------------------------------------------------------------------------------
+in cisst/cisstOSAbstraction/osaSocketServer.h
++l63
+    /*! \return Socket file descriptor */
+    int GetIdentifier(void) const {
+        return ServerSocketFD;
+    };
+
+--------------------------------------------------------------------------------------------------------------------------
+in cisst/cisstParameterTypes/code/CMakeLists.txt 
++l51
+      prmSimulinkDataPacket.cpp                                                 
+      prmSocketDataPacket.cpp                                                   
+      prmTwoWaySocket.cpp                                                       
++l86                                                                        
+      prmSimulinkDataPacket.h                                                   
+      prmSocketDataPacket.h                                                     
+      prmTwoWaySocket.h    
+
+--------------------------------------------------------------------------------------------------------------------------
+in  cisst/cisstParameterTypes/cisstParameterTypes.i 
++l83                                                                            
+%include "cisstParameterTypes/prmSimulinkDataPacket.h"
+%include "cisstParameterTypes/prmSocketDataPacket.h"
+%include "cisstParameterTypes/prmTwoWaySocket.h"
+
+--------------------------------------------------------------------------------------------------------------------------
+in cisst/cisstParameterTypes/prmPython.h 
++l56                                       
+#include <cisstParameterTypes/prmSimulinkDataPacket.h> 
+#include <cisstParameterTypes/prmSocketDataPacket.h>
+#include <cisstParameterTypes/prmTwoWaySocket.h> 
+
+--------------------------------------------------------------------------------------------------------------------------
+in sawControllers/include/sawControllers/mtsPID.h
++l145
+     //! Enable mtsPID IO (sending torque commands)                             
+     bool EnabledIO;  
+
++l215
+     void EnableIO(const bool & enable);           
+
+--------------------------------------------------------------------------------------------------------------------------
+in sawControllers/code/mtsPID.cpp
++l23
+#include <cisstOSAbstraction/osaSleep.h>  
+
++l38
+EnabledIO(true),    
+                                             
++l54
+EnabledIO(true), 
+
++l98
+ interfaceProvided->AddCommandWrite(&mtsPID::EnableIO, this,               "EnableIO", false); //simulink too over
+
++l459                                                                    
+                                                                              
+         if(EnabledIO) {                                                        
+             Robot.SetTorque(TorqueParam);                                      
+             //CMN_LOG_RUN_WARNING << "RunPID: " << GetName() << std::setprecision(5) << Torque << std::endl;
+         }                 
+   
++l635
+void mtsPID::EnableIO(const bool & enable)
+{
+    EnabledIO = enable;
+}
+
+--------------------------------------------------------------------------------------------------------------------------
+in sawControllers/include/sawControllers/mtsPIDQtWidget.h                              
++l46
+                    double periodInSeconds = 50.0 * cmn_ms, const bool usingSimulinkControl = false);
+                                     
++l102                                                                          
+         mtsFunctionWrite EnableIO;  
+                                      
++l128                                                                    
+     struct SimulinkQtWidgetStruct {                                            
+         mtsFunctionWrite EnableWidget;                                         
+         mtsFunctionWrite Enable;                                               
+         mtsFunctionWrite EnableLogs;                                           
+         mtsFunctionRead  IsEnabled;                                            
+     } SimulinkQtWidget;                                                        
+                                      
++l142                                                  
+     bool isSimulinkEnabled();                                                  
+     void EnablePIDFromSimulinkQt(const mtsBool & enable);                      
+                                                                                 
+     void EnablePID(bool localButtonUsed, bool enable);                         
+                                                                                 
+     bool usingSimulink;       
+                                      
+
+--------------------------------------------------------------------------------------------------------------------------
+in sawControllers/code/Qt/mtsPIDQtWidget.cpp                                                      
++l37
+ #include <cisstMultiTask/mtsInterfaceProvided.h>   
+                            
++l46
+ mtsPIDQtWidget::mtsPIDQtWidget(const std::string & componentName, unsigned int numberOfAxis,
+                                double periodInSeconds, const bool usingSimulinkControl):
+
++l52                                                                           
+     usingSimulink = usingSimulinkControl;   
+
++l90
+         interfaceRequired->AddFunction("EnableIO",                  PID.EnableIO);
+
++l111                                                                          
+     if(usingSimulink) {                                                        
+         mtsInterfaceRequired * simulinkQtInterfaceRequired = AddInterfaceRequired("SimulinkQtInterfacePIDCommand");
+         if (simulinkQtInterfaceRequired) {                                     
+             simulinkQtInterfaceRequired->AddFunction("EnableSimulinkWidgetFromPID", SimulinkQtWidget.EnableWidget);
+             simulinkQtInterfaceRequired->AddFunction("EnableSimulinkFromPID",       SimulinkQtWidget.Enable);
+             //the below means COMMENCED, as in, is Simulink in control?        
+             simulinkQtInterfaceRequired->AddFunction("IsSimulinkEnabled",           SimulinkQtWidget.IsEnabled);
+         }                                                                      
+                                                                                
+         mtsInterfaceProvided * simulinkQtInterfaceProvided = AddInterfaceProvided("SimulinkQtInterfaceSimulinkCommand");
+         if (simulinkQtInterfaceProvided) {                                     
+             simulinkQtInterfaceProvided->AddCommandWrite(&mtsPIDQtWidget::EnablePIDFromSimulinkQt , this,  "EnablePIDFromSimulink",     mtsBool());
+             }                                                                  
+     }                
+                                                  
++l195                                                                          
+     EnablePID(true, toggle);                                                                           
+                                   
++l349,                                                                     
+     if(usingSimulink)                                                          
+         SimulinkQtWidget.EnableWidget(toggle);                   
+
++l619
+bool mtsPIDQtWidget::isSimulinkEnabled()
+{
+    if(usingSimulink)
+    {
+        bool simEnabled = false;
+        mtsExecutionResult executionResult = SimulinkQtWidget.IsEnabled(simEnabled);
+        if (!executionResult.IsOK()) {
+            CMN_LOG_CLASS_RUN_WARNING << "ExecuteTrajectory: Call to SimulinkQtWidget.IsEnabled(simEnabled) failed \""
+                                      << executionResult << "\"" << std::endl;
+        }
+        return simEnabled;
+    }
+
+    return false;
+}
+
+void mtsPIDQtWidget::EnablePIDFromSimulinkQt(const mtsBool &enable)
+{
+    EnablePID(false, enable);
+}
+
+
+void mtsPIDQtWidget::EnablePID(bool localButtonUsed, bool enable)
+{
+    if(usingSimulink && enable) {
+        SimulinkQtWidget.Enable(!enable);  //turn off Simulink if PID is going on!!
+        PID.EnableIO(enable); //make sure to re-enable IO, disabling can only happen if Simulink used
+    }
+
+    if(localButtonUsed) {
+        PID.Enable(enable);
+        CMN_LOG_RUN_WARNING << "PID controller being turned " << (enable ? "ON" : "OFF") << std::endl;
+    } else {
+        PID.EnableIO(enable);
+        CMN_LOG_RUN_WARNING << "PID IO being turned " << (enable ? "ON" : "OFF") << std::endl;
+        QCBEnablePID->setChecked(enable);
+    }
+
+    //update GUI
+    QVWDesiredPositionWidget->setEnabled(enable);
+    QVWPGainWidget->setEnabled(enable);
+    QVWIGainWidget->setEnabled(enable);
+    QVWDGainWidget->setEnabled(enable);
+    QVWDesiredEffortWidget->setEnabled(enable);
+    QVRCurrentEffortWidget->setEnabled(enable);
+}                           
+
+--------------------------------------------------------------------------------------------------------------------------
+in sawIntuitiveResearchKit/include/sawIntuitiveResearchKit/mtsIntuitiveResearchKitConsole.h
++l52                                                                         
+         /*! Create a new Simulink Controller component and connect it to the proper RobotIO
+           interface. */                                                        
+         void ConfigureSimulinkController(const unsigned int numJoints, const double & periodInSeconds = 0.0*cmn_ms );
+
++l64                                                                          
+         const bool & UsingSimulink(void) const;                                
+
++l67                                                                            
+         const std::string & SimulinkControllerComponentName(void) const;       
+
++l71                                                                       
+         bool mUsingSimulink;                                                   
+
++l78                                                                         
+         //Simulink Controller                                                  
+         std::string mSimulinkControllerComponentName;    
+
+--------------------------------------------------------------------------------------------------------------------------
+in sawIntuitiveResearchKit/code/mtsIntuitiveResearchKitConsole.cpp
+                                     
++l28                                                                            
+ #include <sawControllers/mtsSimulinkController.h>
+                                     
++l60                                                                         
+ void mtsIntuitiveResearchKitConsole::Arm::ConfigureSimulinkController(const unsigned int numJoints, const double &periodInSeconds)
+ {                                                                              
+     mSimulinkControllerComponentName = mName + "-SimulinkControl";             
+                                                                                
+     mtsManagerLocal * componentManager = mtsManagerLocal::GetInstance();       
+     mtsSimulinkController * simulinkControllerMaster = new mtsSimulinkController(mSimulinkControllerComponentName,
+                                     (periodInSeconds != 0.0) ? periodInSeconds : 1.0 * cmn_ms, numJoints );
+     simulinkControllerMaster->Configure(mPIDConfigurationFile);                
+     componentManager->AddComponent(simulinkControllerMaster);                  
+     componentManager->Connect(SimulinkControllerComponentName(), "RobotJointTorqueInterface", IOComponentName(), Name());
+                                                                                
+     if (periodInSeconds == 0.0) {                                              
+         componentManager->Connect(SimulinkControllerComponentName(), "ExecIn", 
+                                   IOComponentName(), "ExecOut");               
+     }                                                                          
+ }                                                                              
+                                     
++l80                                                                            
+                                                        const bool usingSimulinkControl)
+                                     
++l84                                                                            
+     mUsingSimulink = usingSimulinkControl;                                     
+                                     
++l90                                                                      
+             mtsIntuitiveResearchKitMTM * master = new mtsIntuitiveResearchKitMTM(Name(), periodInSeconds, UsingSimulink());
+             master->Configure(mArmConfigurationFile);                          
+             componentManager->AddComponent(master);    
+                                     
++l97                                                                
+         mtsIntuitiveResearchKitPSM * slave = new mtsIntuitiveResearchKitPSM(Name(), periodInSeconds, UsingSimulink());
+             slave->Configure(mArmConfigurationFile);                           
+             componentManager->AddComponent(slave);         
+                                    
++l129                                                                            
+         if(UsingSimulink()) {                                                  
+             componentManager->Connect(Name(), "SimulinkControlCommand",        
+                                   SimulinkControllerComponentName(), "SimulinkController");
+             componentManager->Connect(SimulinkControllerComponentName(), "RobotPSM",
+                                   Name(), "Robot");                            
+         }      
+
++l144
+const bool & mtsIntuitiveResearchKitConsole::Arm::UsingSimulink(void) const {
+    return mUsingSimulink;
+}
+                                     
++l156                                                              
+ const std::string & mtsIntuitiveResearchKitConsole::Arm::SimulinkControllerComponentName(void) const {
+     return mSimulinkControllerComponentName;   
+ } 
+
+--------------------------------------------------------------------------------------------------------------------------
+in sawIntuitiveResearchKit/include/sawIntuitiveResearchKit/mtsIntuitiveResearchKitArm.h
++l30                     
+ #include <cisstRobot/robManipulator.h>          
+ #include <cisstRobot/robLSPB.h>                                         
+
++l40
+    mtsIntuitiveResearchKitArm(const std::string & componentName, const double periodInSeconds, const bool usingSimulinkControl = false);       
+
++l93
+    virtual void GetRobotCartVelFromJacobian(vctDoubleVec & slaveVelAndPos) const;
+    virtual void GetJointTorqueFromForceTorque(vctDoubleVec & torqueValues) const;   
+
++l133
+    struct {
+        mtsFunctionWrite SignalTrajectoryRunning;
+        mtsFunctionWrite SetDesiredJointPosition;
+        mtsFunctionWrite SetDesiredCartesianPosition;
+        mtsFunctionRead  GetControllerTypeIsJoint;
+
+        mtsBool          UsingJointControl;
+    } SimulinkController;   
+
++l213
+     bool usingSimulink;  
+
+--------------------------------------------------------------------------------------------------------------------------
+in sawIntuitiveResearchKit/code/mtsIntuitiveResearchKitArm.cpp
++l35
+mtsIntuitiveResearchKitArm::mtsIntuitiveResearchKitArm(const std::string & componentName, const double periodInSeconds, const bool usingSimulinkControl):
+
++l38
+     usingSimulink = usingSimulinkControl;  
+
++l99
+    if(usingSimulink) {
+        mtsInterfaceRequired * simulinkInterfaceRequired = AddInterfaceRequired("SimulinkControlCommand");
+        if (simulinkInterfaceRequired) {
+            simulinkInterfaceRequired->AddFunction("SignalTrajEvent",            SimulinkController.SignalTrajectoryRunning);
+            simulinkInterfaceRequired->AddFunction("SetPositionJoint",           SimulinkController.SetDesiredJointPosition);
+            simulinkInterfaceRequired->AddFunction("SetPositionCartDes",         SimulinkController.SetDesiredCartesianPosition);
+            simulinkInterfaceRequired->AddFunction("GetSimControllerType",       SimulinkController.GetControllerTypeIsJoint);
+         }
+    }
+
++l135
+	RobotInterface->AddCommandRead(&mtsIntuitiveResearchKitArm::GetRobotCartVelFromJacobian, this, "GetRobotCartVelFromJacobian");
+        RobotInterface->AddCommandRead(&mtsIntuitiveResearchKitArm::GetJointTorqueFromForceTorque,this, "GetJointTorqueFromForceTorque");
+      
++l420
+void mtsIntuitiveResearchKitArm::SetPositionJointLocal(const vctDoubleVec & newPosition)
+{
+    JointSetParam.Goal().Zeros();
+    JointSetParam.Goal().Assign(newPosition, NumberOfJoints());
+
+    //Send it to both, logic to turn PID off when Simulink is on is handled through the QT Widget
+    mtsExecutionResult executionResult;
+    executionResult = PID.SetPositionJoint(JointSetParam);
+    if (!executionResult.IsOK()) {
+        CMN_LOG_CLASS_RUN_WARNING << GetName() << ": Call to PID.SetJointPosition failed \""
+                                  << executionResult << "\"" << std::endl;
+    }
+
+    if(usingSimulink) {
+        SimulinkController.GetControllerTypeIsJoint(SimulinkController.UsingJointControl);
+        if(SimulinkController.UsingJointControl) {
+            SimulinkController.SetDesiredJointPosition(JointSetParam);
+        } else { //using Cartesian Control
+            SimulinkController.SetDesiredCartesianPosition(CartesianSetParam);
+        }
+    }
+}  
+
+         
++l516
+/*original was supposed to just return Jacobian, but couldn't pass double** through the provided interface,
+so instead the calculation of the cartesian space velocity will be done here. Joint space velocity will be
+passed in, this will use the available Jacobian and return the cartesian space velocity in the same vector*/
+void mtsIntuitiveResearchKitMTM::GetRobotCartVelFromJacobian( vctDoubleVec & slaveVelAndPos ) const
+{
+    //From Chapter 4 of "A mathematical introduction to robotic manipulation" by Murray
+    vctDoubleVec jointVel, pos_t0, cartVel;
+    jointVel.SetSize(NumberOfJoints); //rad and m
+    pos_t0.SetSize(3);
+    cartVel.SetSize(6);
+
+    for (unsigned int i=0; i < slaveVelAndPos.size(); i++)
+    {
+        if(i < jointVel.size())
+            jointVel.at(i) = slaveVelAndPos.at(i);
+        else
+            pos_t0.at(i - jointVel.size()) = slaveVelAndPos.at(i);
+    }
+
+    //From Zhan-Fan Quek, Stanford
+    vctDoubleFrm3 cartesianPosRotCurrent;
+    vctFrame4x4<double> t_FKResults;
+    vctDoubleRot3 t_FKResultsRotation;
+
+    t_FKResults = Manipulator.ForwardKinematics(JointGet);
+    Manipulator.JacobianSpatial(JointGet);
+
+    // Update the rotation matrix of the robot end effector
+    for (int i = 0; i < 3; i++)
+    {
+        for (int j = 0; j < 3; j++)
+            t_FKResultsRotation[i][j] = (t_FKResults.Rotation())[i][j];
+    }
+
+    cartesianPosRotCurrent.From(t_FKResults);
+
+    double** robotJacobian = Manipulator.Js; //spatial Jacobian
+    vctDynamicMatrix<double> manipulatorJacobian;
+    manipulatorJacobian.SetSize(6,NumberOfJoints);
+
+    // Determine the manipulator jacobian
+    for (int j = 0; j < 6; j++)
+    {
+        //NOTE the robotJacobian is the spatial Jacobian; columns are NOT associated with Joints
+        //The first three rows are linear velocities; so it's the spatial Jacobian linear velocity plus the cross product of the position and the angular velocities (v = theta_dot x p)
+        //And the last three rows are angular velocities. So your final manipulator Jacobian contains information about the linear and angular velocities of the end effector WITH RESPECT
+        //TO the base frame. Or, http://summerschool2009.robotik-bs.de/downloads/lecture_notes/summerschool09_mmr_part09.pdf
+        manipulatorJacobian[0][j] = robotJacobian[j][0] + robotJacobian[j][4] * cartesianPosRotCurrent.Translation()(2) - robotJacobian[j][5] * cartesianPosRotCurrent.Translation()(1);
+        manipulatorJacobian[1][j] = robotJacobian[j][1] + robotJacobian[j][5] * cartesianPosRotCurrent.Translation()(0) - robotJacobian[j][3] * cartesianPosRotCurrent.Translation()(2);
+        manipulatorJacobian[2][j] = robotJacobian[j][2] + robotJacobian[j][3] * cartesianPosRotCurrent.Translation()(1) - robotJacobian[j][4] * cartesianPosRotCurrent.Translation()(0);
+        manipulatorJacobian[3][j] = robotJacobian[j][3];
+        manipulatorJacobian[4][j] = robotJacobian[j][4];
+        manipulatorJacobian[5][j] = robotJacobian[j][5];
+    }
+
+    // Calculate the end effector velocities
+    for (unsigned int i = 0; i < 6; i++)
+    {
+        cartVel.at(i) = 0;
+
+        for (unsigned int j = 0; j < NumberOfJoints-1; j++)
+            cartVel(i)  = cartVel(i)  + manipulatorJacobian(i,j)  * jointVel(j);
+    }
+//    CMN_LOG_RUN_WARNING << "cartVel = " << cartVel << std::endl;
+
+    //put calculated cartesian velocity in return vector
+    for (unsigned int i = 0; i < slaveVelAndPos.size(); i++)
+        slaveVelAndPos.at(i) = (i < cartVel.size()) ? cartVel.at(i) : 0;
+}
+
+/*Similar to GetRobotCartVelFromJacobian, original was supposed to just return Jacobian, but couldn't pass
+double** through the provided interface, so instead the calculation of the joint torques from force torque
+will be done here. ForceTorque (size = 6) will be passed in size 7 (NumberOfJoints) vector torqeValues and
+return joint torques in the same vector. Note, grip force is ASSUMED ZERO */
+void mtsIntuitiveResearchKitMTM::GetJointTorqueFromForceTorque(vctDoubleVec &torqueValues) const
+{
+    vctDoubleVec cartesianPIDCalculatedForceTorque, cartesianForceJointTorque, cartesianTorqueJointTorque, cartesianJointTorque;
+    cartesianPIDCalculatedForceTorque.SetSize(6);
+    cartesianPIDCalculatedForceTorque.SetAll(0.0);
+    cartesianForceJointTorque.SetSize(NumberOfJoints);
+    cartesianForceJointTorque.SetAll(0.0);
+    cartesianTorqueJointTorque.SetSize(NumberOfJoints);
+    cartesianTorqueJointTorque.SetAll(0.0);
+    cartesianJointTorque.SetSize(NumberOfJoints-1);
+    cartesianJointTorque.SetAll(0.0);
+
+    vct6 forcePID, torquePID;
+    forcePID.SetAll(0.0);
+    torquePID.SetAll(0.0);
+
+    //Populate force/torque vector calculated by cartesian controller
+    for (unsigned int i=0; i < cartesianPIDCalculatedForceTorque.size(); i++)
+        cartesianPIDCalculatedForceTorque.at(i) = torqueValues.at(i);
+
+    //From Zhan-Fan Quek, Stanford
+    vctDoubleFrm3 cartesianPosRotCurrent;
+    vctFrame4x4<double> t_FKResults;
+    vctDoubleRot3 t_FKResultsRotation;
+
+    t_FKResults = Manipulator.ForwardKinematics(JointGet);
+    Manipulator.JacobianSpatial(JointGet);
+
+    // Update the rotation matrix of the robot end effector
+    for (int i = 0; i < 3; i++)
+    {
+        for (int j = 0; j < 3; j++)
+            t_FKResultsRotation[i][j] = (t_FKResults.Rotation())[i][j];
+    }
+
+    cartesianPosRotCurrent.From(t_FKResults);
+
+    double** robotJacobian = Manipulator.Js; //spatial Jacobian
+    vctDynamicMatrix<double> manipulatorJacobian;
+    manipulatorJacobian.SetSize(6,NumberOfJoints);
+
+    // Determine the manipulator jacobian
+    for (int j = 0; j < 6; j++)
+    {
+        //NOTE the robotJacobian is the spatial Jacobian; columns are NOT associated with Joints
+        //The first three rows are linear velocities; so it's the spatial Jacobian linear velocity plus the cross product of the position and the angular velocities (v = theta_dot x p)
+        //And the last three rows are angular velocities. So your final manipulator Jacobian contains information about the linear and angular velocities of the end effector WITH RESPECT
+        //TO the base frame. Or, http://summerschool2009.robotik-bs.de/downloads/lecture_notes/summerschool09_mmr_part09.pdf
+        manipulatorJacobian[0][j] = robotJacobian[j][0] + robotJacobian[j][4] * cartesianPosRotCurrent.Translation()(2) - robotJacobian[j][5] * cartesianPosRotCurrent.Translation()(1);
+        manipulatorJacobian[1][j] = robotJacobian[j][1] + robotJacobian[j][5] * cartesianPosRotCurrent.Translation()(0) - robotJacobian[j][3] * cartesianPosRotCurrent.Translation()(2);
+        manipulatorJacobian[2][j] = robotJacobian[j][2] + robotJacobian[j][3] * cartesianPosRotCurrent.Translation()(1) - robotJacobian[j][4] * cartesianPosRotCurrent.Translation()(0);
+        manipulatorJacobian[3][j] = robotJacobian[j][3];
+        manipulatorJacobian[4][j] = robotJacobian[j][4];
+        manipulatorJacobian[5][j] = robotJacobian[j][5];
+    }
+
+    //assume UpdateManipulatorJacobian has been run recently
+    // Calculate the respective joint torques from the commanded cartesian force/torque using the jacobian transform
+    vctDynamicMatrix<double> manipulatorJacobianTranspose;
+    manipulatorJacobianTranspose.SetSize(NumberOfJoints, 6);
+    manipulatorJacobianTranspose = manipulatorJacobian.Transpose();
+
+    for (unsigned int i=0; i<cartesianPIDCalculatedForceTorque.size(); i++) {
+        if(i < 3)
+            forcePID(i)  = cartesianPIDCalculatedForceTorque(i);
+        else
+            torquePID(i) = cartesianPIDCalculatedForceTorque(i);
+    }
+
+    for (unsigned int i=0; i < NumberOfJoints-1; i++) {
+        for (unsigned int j=0; j < 6; j++) {
+            cartesianForceJointTorque[i] = cartesianForceJointTorque[i] + manipulatorJacobianTranspose[i][j] * forcePID(j);
+        }
+    }
+
+    for (unsigned int i=0; i < NumberOfJoints; i++) {
+        for (unsigned int j=0; j < 6; j++) {
+            cartesianTorqueJointTorque[i] = cartesianTorqueJointTorque[i] + manipulatorJacobianTranspose[i][j] * torquePID(j);
+        }
+    }
+
+    for (unsigned int i=0; i < cartesianJointTorque.size(); i++) {
+        if(i < 3)
+            cartesianJointTorque(i) = cartesianForceJointTorque(i);
+        else
+            cartesianJointTorque(i) = cartesianTorqueJointTorque(i);
+    }
+
+    for (unsigned int i=0; i < cartesianJointTorque.size(); i++)
+        torqueValues.at(i) = cartesianJointTorque.at(i);
+
+    torqueValues.at(NumberOfJoints - 1) = 0.0; //assume grip force is zero
+}
+
+
+--------------------------------------------------------------------------------------------------------------------------
+in sawIntuitiveResearchKit/include/sawIntuitiveResearchKit/mtsIntuitiveResearchKitMTM.h
+
++l35
+    mtsIntuitiveResearchKitMTM(const std::string & componentName, const double periodInSeconds, const bool usingSimulink);
+
+--------------------------------------------------------------------------------------------------------------------------
+in sawIntuitiveResearchKit/code/mtsIntuitiveResearchKitMTM.cpp
++l33
+mtsIntuitiveResearchKitMTM::mtsIntuitiveResearchKitMTM(const std::string & componentName, const double periodInSeconds, const bool usingSimulink):
+    mtsIntuitiveResearchKitArm(componentName, periodInSeconds, usingSimulink)
+                                  
+--------------------------------------------------------------------------------------------------------------------------
+in sawIntuitiveResearchKit/include/sawIntuitiveResearchKit/mtsIntuitiveResearchKitPSM.h
++l35
+     mtsIntuitiveResearchKitPSM(const std::string & componentName, const double periodInSeconds, const bool usingSimulinkControl);
+
+--------------------------------------------------------------------------------------------------------------------------
+in sawIntuitiveResearchKit/code/mtsIntuitiveResearchKitPSM.cpp
++l32
+mtsIntuitiveResearchKitPSM::mtsIntuitiveResearchKitPSM(const std::string & componentName, const double periodInSeconds, const bool usingSimulink):
+    mtsIntuitiveResearchKitArm(componentName, periodInSeconds, usingSimulink)
+

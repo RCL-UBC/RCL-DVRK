@@ -1,0 +1,312 @@
+These are code snippets which include the logic we use for doing "waypoint mode" following; i.e. there is an external system commanding the desired position of the robot (packet format [t, R], where t = [x y z], R = [r11 r12 r13; r21 r22 r23; r31 r32 r33]), and once this position is achieved (or a timeout occurs trying to get to this position), the robot will return it's acheived position (using the same [t,R] format)
+
+===========================
+mtsTeleoperation.h
+===========================
+#include <cisstParameterTypes/prmTwoWaySocket.h>
+#include <cisstRobot/robManipulator.h>
+#include <math.h>  //for fabs
+
+void EnableWaypoints(const mtsBool & enable); //we added a checkbox in the mtsTeleoperationQtWidget to enable "waypoint mode"
+
+bool CheckIfAchievedWaypoint();
+int ReadInWaypointBuffer(char* socketData, vct3* slaveTranslation, vctMatRot3* slaveRotation, int bytesRead);
+
+bool IsWaypointsEnabled;
+bool IsMovingToWaypoint;
+int  NumCyclesTryingToGetToWaypoint;
+  
+prmTwoWaySocket* socketComm;
+
+===========================
+mtsTeleoperation.cpp
+===========================
+#include <cisstParameterTypes/prmSocketDataPacket.h>
+
+void mtsTeleOperation::Init(void)
+{  
+    this->IsWaypointsEnabled = false;
+    this->IsMovingToWaypoint = false;
+  
+    this->StateTable.AddData(Master.PositionCartesianCurrent, "MasterCartesianPosition");
+    this->StateTable.AddData(Slave.PositionCartesianCurrent, "SlaveCartesianPosition");
+    
+    // Setup CISST Interface
+    mtsInterfaceRequired * masterRequired = AddInterfaceRequired("Master");
+    if (masterRequired) {
+        masterRequired->AddFunction("GetPositionCartesian", Master.GetPositionCartesian);
+        masterRequired->AddFunction("SetPositionCartesian", Master.SetPositionCartesian);
+        masterRequired->AddFunction("GetGripperPosition", Master.GetGripperPosition);
+        masterRequired->AddFunction("SetRobotControlState", Master.SetRobotControlState);
+        masterRequired->AddFunction("SetWrench", Master.SetWrench);
+    }
+  
+    mtsInterfaceRequired * slaveRequired = AddInterfaceRequired("Slave");
+    if (slaveRequired) {
+        slaveRequired->AddFunction("GetPositionCartesian", Slave.GetPositionCartesian);
+        slaveRequired->AddFunction("SetPositionCartesian", Slave.SetPositionCartesian);
+        slaveRequired->AddFunction("SetOpenAngle", Slave.SetOpenAngle);
+        slaveRequired->AddFunction("SetRobotControlState", Slave.SetRobotControlState);
+    }
+  
+    mtsInterfaceProvided * providedSettings = AddInterfaceProvided("Setting");
+    if (providedSettings) {  
+        providedSettings->AddCommandWrite(&mtsTeleOperation::EnableWaypoints, this, "EnableWaypoints", mtsBool());
+  
+        providedSettings->AddCommandReadState(this->StateTable, Master.PositionCartesianCurrent, "GetPositionCartesianMaster");
+        providedSettings->AddCommandReadState(this->StateTable, Slave.PositionCartesianCurrent, "GetPositionCartesianSlave");
+    }
+}
+
+
+
+void mtsTeleOperation::Run(void)
+{
+    ProcessQueuedCommands();
+    ProcessQueuedEvents();
+  
+    // increment counter
+    Counter++;
+  
+    // get master Cartesian position
+    mtsExecutionResult executionResult;
+    executionResult = Master.GetPositionCartesian(Master.PositionCartesianCurrent);
+    if (!executionResult.IsOK()) {
+        CMN_LOG_CLASS_RUN_ERROR << "Run: call to Master.GetPositionCartesian failed \""
+                                << executionResult << "\"" << std::endl;
+    }
+    vctFrm4x4 masterPosition(Master.PositionCartesianCurrent.Position());
+  
+    // get slave Cartesian position
+    executionResult = Slave.GetPositionCartesian(Slave.PositionCartesianCurrent);
+    if (!executionResult.IsOK()) {
+        CMN_LOG_CLASS_RUN_ERROR << "Run: call to Slave.GetPositionCartesian failed \""
+                                << executionResult << "\"" << std::endl;
+    }
+    vctFrm4x4 slavePosition(Slave.PositionCartesianCurrent.Position());
+  
+    // mtm w.r.t. psm
+    vctMatRot3 master2slave;
+    master2slave.Assign(-1.0, 0.0, 0.0,
+                         0.0,-1.0, 0.0,
+                         0.0, 0.0, 1.0);
+    if (IsEnabled) {
+  
+        if(IsWaypointsEnabled) {
+            if(IsMovingToWaypoint){
+                if(CheckIfAchievedWaypoint() || (NumCyclesTryingToGetToWaypoint > 700)) { //Wait just over 2 seconds)
+                    if(socketComm->IsSendSocketConnected()) {
+                        vctDoubleVec achievedPos(12,0.0);
+                        for(unsigned int i = 0; i < 3; i++)
+                            achievedPos.at(i) = cmn_m * slavePosition.Translation().at(i); //convert to mm from m, *1000
+  
+                        vctMatRot3  rotTemp;
+                        rotTemp.Assign(vctMatRot3::Identity() * slavePosition.Rotation());
+  
+                        unsigned int index = 3;
+                        for(unsigned int j = 0; j < 3; j++) {
+                            for(unsigned int k  = 0; k < 3; k++) {
+                                achievedPos.at(index) = rotTemp[j][k]; //TODO: check this
+                                index++;
+                            }
+                        }
+  
+                        prmSocketDataPacket* dp = new prmSocketDataPacket("a", ",", achievedPos);
+                        int ret = socketComm->SendData(dp, "%08.3f");
+                        if(ret == -1) {
+                            CMN_LOG_RUN_WARNING << "Send returned -1" << std::endl;
+                        }
+                        else {
+                            CMN_LOG_RUN_WARNING << "Achieved Pos: " << achievedPos << std::endl;
+//                            if(logsEnabled) {
+//                                //TODO: log it!
+//                            }
+                        }
+  
+                        IsMovingToWaypoint = false;
+                    }
+                    else
+                        CMN_LOG_RUN_WARNING << "ACHIEVED WAYPOINT BUT SEND SOCKET BROKEN" << std::endl;
+                }
+                else {
+                    NumCyclesTryingToGetToWaypoint++;
+//                    if(Counter % 1000)
+//                        CMN_LOG_RUN_WARNING << "Waiting to get to commanded pos" << std::endl;
+                }
+            }
+            else {
+                if(socketComm->IsRecvSocketConnected()) {
+                    char * nextWaypointData = new char[socketComm->GetBufferRecvSize()];
+                    int bytesRead = socketComm->RecvData(nextWaypointData);
+  
+                    if(bytesRead > 0) {
+                        vct3 desSlaveTranslation;
+                        vctMatRot3 desSlaveRotation;
+  
+                        int ret = ReadInWaypointBuffer(nextWaypointData, &desSlaveTranslation, &desSlaveRotation, bytesRead);
+                        if(ret == -1)
+                            CMN_LOG_RUN_WARNING << "Wrong type of packet received" << std::endl;
+                        else  {
+                            CMN_LOG_RUN_WARNING << "Commanded Translation = " << desSlaveTranslation << std::endl
+                                                << "Commanded Rotation = "    << desSlaveRotation << std::endl;
+  
+                            // compute desired slave position
+                            vctFrm4x4 slaveCartesianDesired;
+                            slaveCartesianDesired.Translation().Assign(desSlaveTranslation);
+                            slaveCartesianDesired.Rotation().FromNormalized(desSlaveRotation);
+                            Slave.PositionCartesianDesired.Goal().FromNormalized(slaveCartesianDesired);
+  
+                            // Slave go this cartesian position
+                            Slave.SetPositionCartesian(Slave.PositionCartesianDesired);
+  
+                            IsMovingToWaypoint = true;
+                            NumCyclesTryingToGetToWaypoint = 0;
+                        }
+                    }
+                }
+                else {
+                    CMN_LOG_RUN_WARNING << "RECV SOCKET BROKEN - Disabling Waypoint mode! Turning off servers. Shutting down!" << std::endl;
+                    EnableWaypoints(false);
+                }
+            }
+  
+        }
+        else {      //regular teleoperation
+	...
+	}
+  }
+}
+
+
+void mtsTeleOperation::EnableWaypoints(const mtsBool &enable)
+{
+    IsWaypointsEnabled = enable.Data;
+  
+    // Set Master/Slave to Teleop (Cartesian Position Mode)
+    SetMasterControlState();
+    Slave.SetRobotControlState(mtsStdString("Teleop"));
+  
+    if (IsWaypointsEnabled) {
+        CMN_LOG_RUN_WARNING << "Enabling waypoints" << std::endl;
+        // Orientate Master with Slave
+        vctFrm4x4 masterCartesianDesired;
+        masterCartesianDesired.Translation().Assign(MasterLockTranslation);
+        vctMatRot3 masterRotation;
+        masterRotation = RegistrationRotation.Inverse() * Slave.PositionCartesianCurrent.Position().Rotation();
+        masterCartesianDesired.Rotation().FromNormalized(masterRotation);
+  
+        // Send Master command postion
+        Master.PositionCartesianDesired.Goal().FromNormalized(masterCartesianDesired);
+        Master.SetPositionCartesian(Master.PositionCartesianDesired);
+  
+        //setup sockets
+        socketComm = new prmTwoWaySocket(12345,54321,"137.82.56.245", 110,110);
+  
+        struct timeval tv;
+        tv.tv_sec  = 20;
+        tv.tv_usec = 0;
+  
+        bool recvConnected = socketComm->ConnectRecvSocket(tv);
+  
+        tv.tv_sec  = 1;
+        tv.tv_usec = 0;
+        bool sendConnected = socketComm->ConnectSendSocket(tv);
+  
+        if(!recvConnected)
+            CMN_LOG_RUN_WARNING << "Failed to open receive socket!" << std::endl;
+        if(!sendConnected)
+            CMN_LOG_RUN_WARNING << "Failed to open send socket!" << std::endl;
+  
+        if(!(recvConnected && sendConnected))
+        {
+            IsWaypointsEnabled = false;
+            CMN_LOG_RUN_WARNING << "Waypoint Mode NOT enabled" << std::endl;
+        }
+    }
+    else {
+        if(socketComm == 0) {
+            CMN_LOG_RUN_WARNING << "What are you doing? You already disabled waypoints!" << std::endl;
+            return;
+        }
+  
+        CMN_LOG_RUN_WARNING << "DISABLING WAYPOINTS" << std::endl;
+        socketComm->CloseRecvSocket();
+        socketComm->CloseSendSocket();
+  
+        delete socketComm;
+        socketComm = 0;
+    }
+}
+
+
+bool mtsTeleOperation::CheckIfAchievedWaypoint()
+{
+    vctFrm4x4 slavePosition(Slave.PositionCartesianCurrent.Position());
+    vctFrm4x4 desiredPosition(Slave.PositionCartesianDesired.Goal());
+  
+    vct3 slaveTranslation = slavePosition.Translation();
+    vct3 desiredTranslation = desiredPosition.Translation();
+  
+    vctMatRot3 slaveRotation(slavePosition.Rotation());
+    vctMatRot3 desiredRotation(desiredPosition.Rotation());
+  
+    //TODO: Define good error margins
+    double acceptableError = 0.0015;
+    bool achieved = true;
+    for(int i = 0; achieved && i < 3; i++)
+    {
+        //verify translation
+        achieved = (fabs(slaveTranslation.at(i) - desiredTranslation.at(i)) < acceptableError);
+  
+        for(int j = 0; achieved && j < 3; j++)
+        {
+            //verify rotation; assume error margin 10x greater (radians now instead of meters)
+            achieved = (fabs(slaveRotation[i][j] - desiredRotation[i][j]) < (15*acceptableError));
+        }
+    }
+  
+    return achieved;
+}
+  
+//Returns -1 if wrong packet received; 0 otherwise
+int mtsTeleOperation::ReadInWaypointBuffer(char* socketData, vct3* slaveTranslation, vctMatRot3* slaveRotation, int bytesRead)
+{
+    if(socketData[0] != 'd') //wrong data packet received
+        return -1;
+  
+    int i = 0;
+    int s_ind = 0;
+    char s[10];
+    vctDoubleVec rotVals(9,0.0);
+  
+    for (int b = 0; b < bytesRead; b++) {
+        if(socketData[b] == ',') {  //next joint value
+            if(b > 1) //after flag
+            {
+                s[s_ind] = 0;  //mark end of entry
+                if(i < 3) {
+                    slaveTranslation->at(i) = atof(s) / cmn_m; //data sent in mm, convert to m
+                    i++;
+                }
+                else {
+                    rotVals.at(i-3) = atof(s);
+                    i++;
+                }
+            }
+  
+            slaveRotation->Assign(rotVals.at(0), rotVals.at(1), rotVals.at(2),
+                                  rotVals.at(3), rotVals.at(4), rotVals.at(5),
+                                  rotVals.at(6), rotVals.at(7), rotVals.at(8));
+  
+            //reset temp buffer
+            s_ind    = 0;
+            s[s_ind] = 0; //effective resets the "string"
+        } else {
+            s[s_ind] = socketData[b];
+            s_ind++;
+        }
+    }
+    return 0;
+}
+
+
